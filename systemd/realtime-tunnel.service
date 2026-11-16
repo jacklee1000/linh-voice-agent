@@ -1,0 +1,13 @@
+[Unit]
+Description=Realtime voice quick tunnel (cloudflared)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/linh-voice-agent
+ExecStart=cloudflared tunnel --url http://127.0.0.1:8090 --no-autoupdate --logfile /opt/linh-voice-agent/tunnel.log
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

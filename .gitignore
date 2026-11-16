@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+node_modules/
+*.log
+tunnel.log
+recordings/
+transcripts/
+contacts.csv
+*.mp3
+*.wav
+*.state.json

@@ -1,0 +1,15 @@
+[Unit]
+Description=Realtime Voice Agent - Twilio Media Streams to OpenAI Realtime
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/linh-voice-agent
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=2
+Environment=PORT=8090
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target
