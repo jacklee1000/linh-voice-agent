@@ -1,0 +1,17 @@
+{
+  "name": "linh-voice-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Realtime Vietnamese voice agent bridging Twilio Media Streams to OpenAI Realtime",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "8.23.0"
+  }
+}
