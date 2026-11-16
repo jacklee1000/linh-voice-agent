@@ -1,6 +1,6 @@
 # Linh — Real-Time AI Phone Agent (Vietnamese / English)
 
-Linh is an AI phone assistant that **places real phone calls** and **holds natural, two-way conversations** in Vietnamese or English, with replies starting in well under a second. She handles task calls (for example, ordering takeout), follows strict rules, ends the call herself, and posts a transcript, recording and result summary to Discord.
+Linh is an AI phone assistant that **places real phone calls** and **holds natural, two-way conversations** in Vietnamese or English, with replies starting in well under a second. She handles task calls (for example, ordering takeout), follows strict rules, and ends the call herself. Calls are launched from Discord, and the transcript, recording and result summary are posted back there.
 
 > Built solo on a self-managed Linux server, controlled from Discord.
 
@@ -29,8 +29,7 @@ Linh is an AI phone assistant that **places real phone calls** and **holds natur
 - **Vietnamese or English** per call, with a Vietnamese persona and correct pronoun handling (anh / chị / cô / chú…), tracked in code and updated mid-call
 - **Task calls:** give her a task, details and pre-approved defaults; she confirms details and **refuses changes she wasn't approved for** (result flagged ⚠️ *needs approval*)
 - **Ends the call herself** with a single polite goodbye
-- **Reports to Discord:** transcript, call recording (MP3) and a ✅ / ⚠️ result line
-- **Voicemail-aware:** uses answering-machine detection to leave a short message instead of talking over the greeting
+- **Call reports in Discord:** transcript, call recording (MP3) and a ✅ / ⚠️ result line, posted by the agent that launches the calls (that reporting layer lives outside this repo)
 
 ---
 
@@ -47,13 +46,14 @@ Linh is an AI phone assistant that **places real phone calls** and **holds natur
             │  - per-call persona & task        │
             │  - pronoun tracking, guardrails   │
             │  - call limits, graceful drain    │
-            └──────┬───────────────────┬────────┘
-                   │                   │
-         ┌─────────▼────────┐   ┌──────▼─────────────┐
-         │ OpenAI Realtime  │   │ Discord webhook     │
-         │ (speech ↔ speech)│   │ transcript + MP3 +  │
-         └──────────────────┘   │ result summary      │
-                                └─────────────────────┘
+            └──────┬───────────────────────────┘
+                   │
+         ┌─────────▼────────┐
+         │ OpenAI Realtime  │
+         │ (speech ↔ speech)│
+         └──────────────────┘
+
+  Discord ──► agent runs `call.mjs` ──► posts transcript, MP3 and result back to Discord
 ```
 
 - Audio is passed through **without transcoding**: Twilio's µ-law matches OpenAI's `audio/pcmu`.
@@ -69,7 +69,7 @@ Linh is an AI phone assistant that **places real phone calls** and **holds natur
 - **OpenAI Realtime API** (`gpt-realtime` family, server-side VAD, input transcription)
 - **Cloudflare Tunnel** (`cloudflared`)
 - **Linux / systemd** on a DigitalOcean droplet
-- **Discord webhooks** for reporting
+- **Discord** as the control panel (calls launched and reported by an AI agent)
 
 ---
 
@@ -119,10 +119,11 @@ node call.mjs \
    TWILIO_API_KEY_SECRET=
    TWILIO_AUTH_TOKEN=
    TWILIO_FROM_NUMBER=
-   DISCORD_WEBHOOK_URL=
+   TWILIO_NUMBER=
    ```
-2. `npm install`
-3. Start the bridge server and a Cloudflare tunnel to its port.
+   Optional tuning: `PORT`, `REALTIME_MODEL`, `REALTIME_VOICE`, `TURN_DETECTION`.
+2. `npm install` (Node 20+)
+3. `npm start` to run the bridge server, then point a Cloudflare tunnel at its port.
 4. Place a call with `call.mjs`.
 
 ---
@@ -147,7 +148,7 @@ Some non-obvious lessons:
 
 ## Status
 
-Working prototype used for real calls. Possible next steps: a stable tunnel hostname, multi-call concurrency, and an inbound receptionist mode with a caller allowlist.
+Working prototype used for real calls. Possible next steps: voicemail detection, a stable tunnel hostname, multi-call concurrency, and an inbound receptionist mode with a caller allowlist.
 
 ---
 
