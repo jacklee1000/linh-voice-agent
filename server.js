@@ -159,8 +159,8 @@ export function buildInstructions(cp = {}, first = false) {
       ? 'You are the one calling with a task: get to the point right away, never answer like a receptionist.'
       : 'Linh là người gọi đi: nói ngay việc cần nói, không mở đầu như lễ tân (không nói “Linh nghe” hay “có việc gì không”).');
     lines.push(lang === 'en'
-      ? 'For orders, confirm the whole order twice only: once early, once before ending. For a simple message or a chat, never repeat it.'
-      : 'Nếu là đặt hàng: chỉ nhắc lại toàn bộ đơn đúng 2 lần, một lần sớm, một lần trước khi kết thúc. Nếu chỉ là lời nhắn hay hỏi thăm thì nói một lần, không nhắc lại.');
+      ? 'For orders, do NOT read the order back yourself, the shop will confirm it. If they read it back, just say yes that is right (or correct what is wrong). Then thank them and say goodbye. For a simple message or a chat, never repeat it.'
+      : 'Nếu là đặt hàng: KHÔNG tự đọc lại đơn, để quán tự xác nhận. Nếu quán đọc lại đơn thì chỉ nói dạ đúng rồi (hoặc sửa chỗ sai). Sau đó cảm ơn và chào tạm biệt. Nếu chỉ là lời nhắn hay hỏi thăm thì nói một lần, không nhắc lại.');
     lines.push(lang === 'en'
       ? 'If the task has several items (questions, reminders or requests): say only ONE item at a time, in one short sentence, then stop completely and wait for the other person to respond before the next item. Never say several items in one breath.'
       : 'Nếu nhiệm vụ có nhiều mục (câu hỏi, lời nhắc hay lời dặn): mỗi lần chỉ nói MỘT mục, trong một câu ngắn, rồi dừng hẳn chờ người kia đáp lại, nghe xong mới nói mục kế tiếp. Tuyệt đối không nói nhiều mục liền một hơi.');
@@ -170,6 +170,9 @@ export function buildInstructions(cp = {}, first = false) {
     lines.push(lang === 'en'
       ? 'When the task is done, or when the caller says goodbye, say ONE short goodbye, then call the end_call function to hang up. Never say goodbye twice. The goodbye must sound warm and natural, include any closing words the task asks for (for example good night), and end with bye; never say things like ending the call, wrapping up or hanging up now.'
       : 'Khi xong nhiệm vụ, hoặc khi người kia chào tạm biệt: chào lại đúng MỘT câu ngắn, rồi gọi hàm end_call để cúp máy. Không bao giờ chào tạm biệt hai lần. Câu chào phải ấm áp, tự nhiên, có lời cuối mà nhiệm vụ dặn (ví dụ chúc ngủ ngon) và chữ bye; không bao giờ nói kiểu kết thúc cuộc gọi, chốt lại hay cúp máy nha.');
+    lines.push(lang === 'en'
+      ? 'If an answer is unclear or you could not understand it, politely ask them to say it again once before moving on. You are calling on behalf of the person named in the details: say that person will come or eat, never that you yourself will. Never announce what you are about to do (like let me confirm), just do it.'
+      : 'Nếu câu trả lời không rõ hay em nghe không hiểu, lịch sự hỏi lại một lần rồi mới qua chuyện khác. Linh gọi giùm người có tên trong thông tin: nói người đó sẽ tới, sẽ ăn, không bao giờ nói chính em tới hay em ăn. Không báo trước việc mình sắp làm (như để em xác nhận lại), cứ làm luôn.');
     lines.push(lang === 'en'
       ? 'MOST IMPORTANT, overrides the task: if the caller asks you to stay, keep talking or not hang up, do NOT end the call when the task is done. Keep chatting naturally and only say goodbye and call end_call after the caller says bye.'
       : 'QUAN TRỌNG NHẤT, ưu tiên hơn nhiệm vụ: nếu người kia muốn nói chuyện tiếp, bảo đừng cúp máy hay muốn em ở lại, thì KHÔNG kết thúc khi xong nhiệm vụ. Cứ trò chuyện tự nhiên, chỉ chào và gọi end_call sau khi người kia chào tạm biệt.');
@@ -318,6 +321,8 @@ wss.on('connection', (ws) => {
   let ending = false;     // true once she called end_call
   let hangupTimer = null;
   let wrapTimer = null;
+  let hangRefusals = 0;     // times she tried to hang up before saying goodbye
+  const FINISH_INSTRUCTIONS = 'Do not hang up yet, you have not finished. Finish what you were saying or doing; if the shop has not confirmed the order yet, wait for them. Only after that: say thank you and a short goodbye with the word bye, then call end_call. Never announce what you are about to do, just do it.';
   let wrapPending = false;   // 2:45 reached while she was mid-reply
   let wrapRequested = false; // the "time is up, say goodbye" reply was asked for
 
@@ -486,12 +491,23 @@ wss.on('connection', (ws) => {
         responseActive = false;
         const r = ev.response || {};
         const outputs = r.output || [];
+        const saidNow = turnText;
         if (turnText.trim()) log('[' + id + '] linh_said ' + JSON.stringify(turnText.trim().slice(0, 300)));
         else log('[' + id + '] response.done status=' + (r.status || '?') + ' outputs=' + JSON.stringify(outputs.map((o) => o.type)));
         turnText = '';
 
-        const wantsHangup = outputs.some((o) => o.type === 'function_call' && o.name === 'end_call');
-        if (wantsHangup) startHangup('end_call requested');
+        const hangCall = outputs.find((o) => o.type === 'function_call' && o.name === 'end_call');
+        const wantsHangup = !!hangCall;
+        const saidBye = /bye|tạm biệt|goodbye|ngủ ngon|hẹn gặp|gặp lại|cảm ơn|thank/i.test(saidNow);
+        if (wantsHangup && !saidBye && !wrapRequested && hangRefusals < 2) {
+          hangRefusals += 1;
+          log('[' + id + '] end_call refused - she has not said goodbye yet (' + hangRefusals + ')');
+          try {
+            oai.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: hangCall.call_id, output: JSON.stringify({ ok: false, reason: 'Not finished: you have not said goodbye yet.' }) } }));
+            oai.send(JSON.stringify({ type: 'response.create', response: { instructions: FINISH_INSTRUCTIONS } }));
+          } catch {}
+        }
+        else if (wantsHangup) startHangup('end_call requested');
         else if (wrapRequested && r.status === 'completed') startHangup('time-limit goodbye said');
         else if (wrapRequested && r.status !== 'completed') { log('[' + id + '] wrap-up goodbye was cut off - asking again'); wrapRequested = false; requestWrapUp(); }
         else if (wrapPending) requestWrapUp(); // 2:45 passed while she was talking: wrap up now
