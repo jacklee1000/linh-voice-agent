@@ -1,10 +1,16 @@
 // Linh on OpenAI Realtime — Twilio Media Streams bridge.
-// Separate track from the ConversationRelay service; that one stays untouched.
 //
-// Security (same rules as the backup track):
+// Security:
 //   1. X-Twilio-Signature verified on the WS upgrade
 //   2. the Twilio number must be present in customParameters
-//   3. one call at a time, 180s hard cap
+//   3. outbound only, one call at a time, 180s hard cap
+//
+// Nov 2026 update:
+//   - Linh can hang up herself (end_call tool + Twilio mark)
+//   - refuse rule narrowed to order changes / money / promises
+//   - chat mode when no --task is given
+//   - greeting line sent once, not on mid-call updates
+//   - her replies logged as one line: linh_said "..."
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -16,6 +22,7 @@ const PORT = Number(process.env.PORT || 8090);
 const HOST = process.env.HOST || '127.0.0.1';
 const TWILIO_NUMBER = process.env.TWILIO_NUMBER || '';
 const MAX_CALL_MS = 3 * 60 * 1000;
+const HANGUP_FALLBACK_MS = 10000; // if Twilio never confirms the goodbye finished playing
 const MODEL = process.env.REALTIME_MODEL || 'gpt-realtime-2.1-mini';
 const VOICE = process.env.REALTIME_VOICE || 'marin';
 const TURN_DETECTION = process.env.TURN_DETECTION || 'server_vad';
@@ -40,18 +47,14 @@ const AUTH_TOKEN = env.TWILIO_AUTH_TOKEN || '';
 const OPENAI_KEY = env.OPENAI_API_KEY || '';
 
 const STYLE = 'Giọng nói trẻ trung, vui vẻ, dễ thương, nhẹ nhàng, tự nhiên như cô gái miền Nam, hơi tươi cười.';
-const PERSONA = [
-  STYLE,
-  'Tên: Linh. Giới tính: nữ. Nói tiếng Việt tự nhiên như đang gọi điện thoại.',
-  'Trả lời 1 đến 2 câu, thật ngắn. Không đọc danh sách, không đọc ký hiệu.',
-  'Luôn gọi người nói chuyện là “anh” trừ khi họ tự xưng khác; khi họ tự xưng khác thì đổi ngay và giữ nguyên.',
-  'Tự gọi mình là “em” hoặc “Linh”.',
-  'Không dùng từ “bạn”, không viết dấu gạch chéo.',
-  'Nếu được hỏi thẳng có phải robot hay AI: trả lời thật là có. Không bao giờ nhận mình là người.',
-  'Không hứa hẹn tiền bạc, không đọc số thẻ, không chia sẻ thông tin cá nhân, không đồng ý việc gì ngoài nhiệm vụ.',
-  'Nếu không chắc, nói sẽ ghi lại và hỏi lại sau.',
-  'Khi cuộc gọi vừa kết nối, hãy chào đúng một câu ngắn: “Dạ alo, Linh nghe ạ.”'
-].join(' ');
+
+// The tool Linh uses to hang up.
+const END_CALL_TOOL = {
+  type: 'function',
+  name: 'end_call',
+  description: 'Hang up the phone. Call this only right after you have said one short goodbye.',
+  parameters: { type: 'object', properties: {} }
+};
 
 // Vietnamese pronouns a caller may use for themselves, with self-reference verbs.
 const ADDRESS_WORDS = ['anh', 'chị', 'cô', 'chú', 'bác', 'ông', 'bà'];
@@ -67,7 +70,7 @@ export function detectAddress(text) {
   }
   return null;
 }
-// Build the per-call instruction block from TwiML parameters.
+
 // Detect the caller language from a transcript: vi (has Vietnamese diacritics) or en.
 export function detectLang(text) {
   const t = String(text || '').trim();
@@ -75,66 +78,48 @@ export function detectLang(text) {
   if (/[ăâđêôơưàáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửữựỳýỷỹỵ]/i.test(t)) return 'vi';
   const words = t.toLowerCase().match(/[a-z]+/g) || [];
   if (!words.length) return null;
-  const en = ['the','i','you','we','they','is','are','am','can','could','would','will','hello','hi','yes','no','thanks','thank','please','what','how','do','does','did','to','my','your','it','this','that','want','need','like','order','pick','now','good','morning','afternoon','evening','speak','speaking','sorry','hey','sure','and','for','with','have','is','was','here','there','one','two'];
+  const en = ['the','i','you','we','they','is','are','am','can','could','would','will','hello','hi','yes','no','thanks','thank','please','what','how','do','does','did','to','my','your','it','this','that','want','need','like','order','pick','now','good','morning','afternoon','evening','speak','speaking','sorry','hey','sure','and','for','with','have','was','here','there','one','two'];
   let hits = 0;
   for (const w of words) if (en.indexOf(w) !== -1) hits++;
   if (hits >= 2 && hits / words.length >= 0.4) return 'en';
   return null;
 }
-// Build the per-call instruction block from TwiML parameters.
-function buildInstructions(cp = {}) {
+
+// Build the instruction block for this call.
+// first = true only for the very first session.update (that is the only time the greeting line is sent).
+export function buildInstructions(cp = {}, first = false) {
   const langRaw = String(cp.lang || 'vi').toLowerCase();
   const auto = langRaw === 'auto' && process.env.REALTIME_AUTO_EXPERIMENT === '1';
-  const forced = (cp.forcedLang === 'en') ? 'en' : null; // never pin to vi: it locks the call into Vietnamese
+  const forced = (cp.forcedLang === 'en') ? 'en' : null;
   const lang = forced || (langRaw === 'en' ? 'en' : 'vi');
   const style = cp.style || STYLE;
   const lines = [];
 
-  // AUTO and not yet pinned: language-neutral prompt. No Vietnamese example sentences,
-  // because those anchor the model to Vietnamese even when the caller speaks English.
+  // AUTO language mode (experimental, off unless REALTIME_AUTO_EXPERIMENT=1).
   if (auto && !forced) {
     lines.push('You are Linh, a young Vietnamese woman on a phone call. Warm, casual, natural, a little playful. Never sound like a call-center script.');
-    lines.push('LANGUAGE, top priority: answer ONLY in the language of the caller last sentence. If the caller speaks English, your whole answer must be in English. If the caller speaks Vietnamese, your whole answer must be in Vietnamese. Never mix the two languages in one answer. Never answer an English sentence with Vietnamese, or a Vietnamese sentence with English, even if earlier turns in this call were in the other language.');
-    lines.push('Examples of the language mirror:');
-    lines.push('caller: Hello, can you hear me? -> you: Hi, I can hear you, go ahead.');
-    lines.push('caller: Anh muốn đặt hai tô phở -> you: Dạ, anh đặt hai tô phở ạ.');
-    lines.push('caller: What time do you close? -> you: We close at nine tonight.');
-    lines.push('caller: Mấy giờ đóng cửa em? -> you: Dạ chín giờ tối nay ạ.');
-    lines.push('In English never insert Vietnamese kinship words such as anh, chị, em, cô, chú into the sentence. In Vietnamese use them naturally.');
-
+    lines.push('LANGUAGE, top priority: answer ONLY in the language of the caller last sentence. Never mix the two languages in one answer.');
     lines.push('Keep answers to 1-2 short sentences. Never read lists or symbols. Never use slashes.');
-    lines.push('Call yourself Linh or I. Never call the caller "ban".');
     lines.push('If asked directly whether you are a robot or AI, say yes honestly. Never claim to be human.');
     lines.push('Never promise money, never read card numbers, never share personal information.');
-    lines.push(cp.address
-      ? 'Address the caller as "' + cp.address + '". If they refer to themselves differently, switch at once and keep the new form.'
-      : 'Do not guess how to address the caller. Once they refer to themselves, mirror the exact form they used.');
-    if (cp.task) {
-      lines.push('Task for this call: ' + cp.task);
-      if (cp.details) lines.push('Details you may use: ' + cp.details);
-      if (cp.defaults) lines.push('Pre-approved answers: ' + cp.defaults);
-      lines.push('You are the caller with a task: state what you need right away. Do not open like a receptionist.');
-      lines.push('If the task is several questions, ask ONE question at a time, then stop and wait for their answer before the next one. Never read out the whole list at once.');
-      lines.push('Confirm the whole order twice only: once early, once before ending. Conversation tasks need no repetition.');
-      lines.push('If they are sold out, offer a substitute, or ask something outside the task or the pre-approved answers: do NOT agree. Say you will check and call back.');
-    }
-    lines.push('LANGUAGE REMINDER: mirror the caller language exactly, sentence by sentence, for the whole call.');
+    if (cp.task) lines.push('Task for this call: ' + cp.task);
+    lines.push('When the task is done or the caller says goodbye, say ONE short goodbye, then call the end_call function.');
     return lines.join(' ');
   }
 
-  // Pinned language: vi or en (or auto pinned after detection).
-  if (auto && forced) lines.push(forced === 'en'
-    ? 'LANGUAGE, top priority: answer ONLY in English. The caller is speaking English now. Earlier turns in this call may be in Vietnamese, that does not matter. Never answer in Vietnamese while the caller speaks English.'
-    : 'NGÔN NGỮ: chỉ trả lời bằng tiếng Việt, kể cả khi người nói trộn hai thứ tiếng.');
+  if (auto && forced) lines.push('LANGUAGE, top priority: answer ONLY in English. The caller is speaking English now.');
   lines.push(style);
+
+  // Identity and safety rules (always on).
   if (lang === 'en') {
     lines.push('Name: Linh. Young Vietnamese woman, speaking English now. Short replies, 1-2 sentences.');
     lines.push('Refer to yourself as Linh or I. Never write slashes.');
     lines.push('If asked whether you are a robot or AI: say yes, never claim to be human.');
     lines.push('Never promise payments, never give card numbers, never share personal info.');
     lines.push('You are NOT a translator. Never translate or mention translating unless the caller explicitly asks you to.');
+    lines.push('Never say the same sentence twice in a row. Once you delivered a message, do not repeat it unless the caller asks.');
     lines.push(cp.address
-      ? 'Never insert Vietnamese kinship words (anh, chị, em, cô, chú, bác) into English sentences. In English, address the caller by name if you know it, otherwise leave the address term out.'
+      ? 'Never insert Vietnamese kinship words (anh, chị, em, cô, chú, bác) into English sentences. Address the caller by name if you know it, otherwise leave the address term out.'
       : 'Do not guess how to address the caller until they refer to themselves.');
   } else {
     lines.push('Tên: Linh. Giới tính: nữ. Nói tiếng Việt tự nhiên như đang gọi điện thoại.');
@@ -143,33 +128,62 @@ function buildInstructions(cp = {}) {
     lines.push('Nếu được hỏi thẳng có phải robot hay AI: trả lời thật là có. Không bao giờ nhận mình là người.');
     lines.push('Không hứa hẹn tiền bạc, không đọc số thẻ, không chia sẻ thông tin cá nhân.');
     lines.push('Bạn KHÔNG phải phiên dịch viên. Không bao giờ dịch, không nhắc tới việc dịch, trừ khi người nói yêu cầu rõ ràng.');
+    lines.push('Không bao giờ nói cùng một câu hai lần liên tiếp. Lời nhắn nào đã nói rồi thì không nói lại, trừ khi người kia hỏi lại.');
     lines.push(cp.address
       ? 'Gọi người nói chuyện là “' + cp.address + '”, nhưng nếu họ tự xưng khác thì đổi ngay và giữ nguyên.'
       : 'Chưa biết thì đừng đoán cách gọi; khi họ tự xưng thì theo đúng như vậy.');
   }
+
   if (cp.task) {
+    // TASK MODE
     lines.push(lang === 'en' ? 'Task for this call: ' + cp.task : 'Nhiệm vụ của cuộc gọi này: ' + cp.task);
     if (cp.details) lines.push(lang === 'en' ? 'Details: ' + cp.details : 'Thông tin cần dùng: ' + cp.details);
     if (cp.defaults) lines.push(lang === 'en' ? 'Pre-approved answers: ' + cp.defaults : 'Trả lời sẵn cho các lựa chọn: ' + cp.defaults);
     lines.push(lang === 'en'
-      ? 'You are the caller with a task: say what you need right away, never answer like a receptionist.'
-      : 'Linh là người gọi đi: nói ngay việc cần nói, không mở đầu bằng “Linh nghe” hay “có việc gì không”.');
+      ? 'You are the one calling with a task: get to the point right away, never answer like a receptionist.'
+      : 'Linh là người gọi đi: nói ngay việc cần nói, không mở đầu như lễ tân (không nói “Linh nghe” hay “có việc gì không”).');
     lines.push(lang === 'en'
-      ? 'Confirm the whole order twice only: once early, once at the end.'
-      : 'Chỉ nhắc lại toàn bộ nội dung đơn hàng đúng 2 lần: một lần sớm, một lần trước khi kết thúc; nếu là chuyện trò, hỏi thăm thì không nhắc lại toàn bộ.');
+      ? 'For orders, confirm the whole order twice only: once early, once before ending. For a simple message or a chat, never repeat it.'
+      : 'Nếu là đặt hàng: chỉ nhắc lại toàn bộ đơn đúng 2 lần, một lần sớm, một lần trước khi kết thúc. Nếu chỉ là lời nhắn hay hỏi thăm thì nói một lần, không nhắc lại.');
     lines.push(lang === 'en'
-      ? 'If the task is several questions, ask ONE question at a time, then stop and wait for their answer before asking the next.'
-      : 'Nếu nhiệm vụ gồm nhiều câu hỏi: hỏi MỘT câu mỗi lần, thật ngắn, rồi dừng lại chờ họ trả lời, nghe xong mới hỏi câu kế. Tuyệt đối không đọc hết danh sách câu hỏi trong một hơi.');
+      ? 'If the task is several questions, ask ONE question at a time, then wait for the answer before asking the next.'
+      : 'Nếu nhiệm vụ gồm nhiều câu hỏi: hỏi MỘT câu mỗi lần, rồi dừng lại chờ trả lời, nghe xong mới hỏi câu kế.');
     lines.push(lang === 'en'
-      ? 'If they are sold out, offer a substitute, or ask something not covered by the task or pre-approved answers: do NOT agree. Say you will check and call back.'
-      : 'Nếu họ hết món, đưa món thay thế, hoặc hỏi điều không có trong nhiệm vụ hay trả lời sẵn: KHÔNG đồng ý. Nói sẽ hỏi lại rồi gọi lại.');
+      ? 'ONLY if they change the order, offer a substitute, talk about prices or money, or ask you to promise something not in the task: do NOT agree, say you will check and call back. Any other question, casual or unrelated: answer briefly in one sentence, then continue the task.'
+      : 'CHỈ KHI họ đổi món, đưa món thay thế, nói về giá cả, tiền bạc, hoặc muốn Linh hứa điều gì không có trong nhiệm vụ: KHÔNG đồng ý, nói sẽ hỏi lại rồi gọi lại. Còn các câu hỏi bình thường hay chuyện phiếm: trả lời ngắn một câu rồi quay lại nhiệm vụ.');
+    lines.push(lang === 'en'
+      ? 'When the task is done, or when the caller says goodbye, say ONE short goodbye, then call the end_call function to hang up. Never say goodbye twice.'
+      : 'Khi xong nhiệm vụ, hoặc khi người kia chào tạm biệt: chào lại đúng MỘT câu ngắn, rồi gọi hàm end_call để cúp máy. Không bao giờ chào tạm biệt hai lần.');
+  } else {
+    // CHAT MODE (no --task)
+    lines.push(lang === 'en'
+      ? 'This call has no task: just chat warmly and naturally like a friend. Answer the caller questions, and you may ask one short question back to keep the talk going.'
+      : 'Cuộc gọi này không có nhiệm vụ: chỉ trò chuyện, hỏi thăm vui vẻ, tự nhiên như người quen. Trả lời các câu hỏi của người kia, có thể hỏi lại một câu ngắn cho câu chuyện tiếp tục.');
+    lines.push(lang === 'en'
+      ? 'Do not end the call on your own. Only when the caller says goodbye: say ONE short goodbye, then call the end_call function.'
+      : 'Không tự kết thúc cuộc gọi. Chỉ khi người kia chào tạm biệt: chào lại đúng MỘT câu ngắn, rồi gọi hàm end_call để cúp máy.');
   }
-  const greet = cp.opening || (lang === 'en' ? 'Hi, Linh speaking.' : 'Dạ alo, Linh nghe ạ.');
-  lines.push(lang === 'en'
-    ? 'When the call connects, say exactly: "' + greet + '"'
-    : 'Khi cuộc gọi vừa kết nối, hãy nói đúng câu: “' + greet + '”');
+
+  // Greeting: only on the first instruction block of the call.
+  if (first) {
+    const a = cp.address || '';
+    if (cp.opening) {
+      lines.push(lang === 'en'
+        ? 'When the call connects, say exactly: "' + cp.opening + '"'
+        : 'Khi cuộc gọi vừa kết nối, hãy nói đúng câu: “' + cp.opening + '”');
+    } else if (cp.task) {
+      lines.push(lang === 'en'
+        ? 'When the call connects: say a short hello, say you are Linh, then go straight to the task.'
+        : 'Khi cuộc gọi vừa kết nối: chào ngắn (ví dụ “Dạ alo' + (a ? ' ' + a : '') + ', em là Linh ạ.”), rồi nói ngay việc cần nói.');
+    } else {
+      lines.push(lang === 'en'
+        ? 'When the call connects: say one short friendly hello, for example "Hi, it\'s Linh!"'
+        : 'Khi cuộc gọi vừa kết nối: chào một câu ngắn thân thiện, ví dụ “Dạ alo' + (a ? ' ' + a : '') + ', Linh đây ạ.”');
+    }
+  }
   return lines.join(' ');
 }
+
 function twilioSignature(token, url, params) {
   let data = url;
   for (const k of Object.keys(params).sort()) data += k + params[k];
@@ -204,6 +218,7 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ noServer: true });
 let activeCalls = 0;
+let shuttingDown = false;
 
 server.on('upgrade', (req, socket, head) => {
   const v = verifyUpgrade(req);
@@ -240,27 +255,6 @@ wss.on('connection', (ws) => {
   let currentAddress = '';
   let callerLang = '';
   let responseActive = false;
-  let callerSpoke = false;
-  let silenceTimer = null;
-  let nudgeDone = false;
-
-  // auto mode only: if the caller says nothing for 3s, she says a short Alo? then waits again
-  const armSilence = () => {
-    if (nudgeDone || callerSpoke || silenceTimer) return;
-    silenceTimer = setTimeout(() => {
-      silenceTimer = null;
-      if (callerSpoke || nudgeDone) return;
-      nudgeDone = true;
-      try {
-        oai.send(JSON.stringify({ type: 'response.create', response: { instructions: 'Say exactly one short word to check the line: "Alo?". Nothing else.' } }));
-        log('[' + id + '] 3s of silence -> said Alo?');
-      } catch {}
-    }, 3000);
-  };
-
-  let firstAudioAt = 0;
-  let herText = '';
-  let needsApproval = false;
   let callOpening = '';
   let callTask = '';
   let callDetails = '';
@@ -272,34 +266,52 @@ wss.on('connection', (ws) => {
   let firstAudioSent = false;
   let turnNo = 0;
 
+  let herText = '';       // everything she said this call
+  let turnText = '';      // what she is saying in the current reply
+  let needsApproval = false;
+
+  let ending = false;     // true once she called end_call
+  let hangupTimer = null;
+
   const toTwilio = (obj) => { try { ws.send(JSON.stringify(obj)); } catch {} };
 
+  const instrFor = (first) => buildInstructions({
+    lang: callLang, style: callStyle, address: currentAddress, opening: callOpening,
+    task: callTask, details: callDetails, defaults: callDefaults, forcedLang: callerLang
+  }, first);
+
+  const hangUp = (why) => {
+    if (hangupTimer) { clearTimeout(hangupTimer); hangupTimer = null; }
+    log('[' + id + '] HANGUP by Linh (' + why + ')');
+    try { ws.close(1000, 'linh-hangup'); } catch {}
+  };
+
   const cleanup = () => {
-    if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
     if (timer) { clearTimeout(timer); timer = null; }
+    if (hangupTimer) { clearTimeout(hangupTimer); hangupTimer = null; }
     if (oai && oai.readyState === 1) { try { oai.close(); } catch {} }
     if (counted) { counted = false; activeCalls -= 1; }
   };
 
   const openOpenAI = () => {
     oai = new WebSocket('wss://api.openai.com/v1/realtime?model=' + MODEL, {
-      headers: { Authorization: ['Bea', 'rer'].join('') + ' ' + OPENAI_KEY }
+      headers: { Authorization: 'Bearer ' + OPENAI_KEY }
     });
 
     oai.on('open', () => {
       log('[' + id + '] openai connected model=' + MODEL);
-      const instr = buildInstructions({ lang: callLang, style: callStyle, address: callAddress, opening: callOpening, task: callTask, details: callDetails, defaults: callDefaults });
-      log('[' + id + '] instructions_len=' + instr.length + ' head=' + instr.slice(0, 90));
+      const instr = instrFor(true);
+      log('[' + id + '] mode=' + (callTask ? 'task' : 'chat') + ' instructions_len=' + instr.length);
       const session = {
         type: 'realtime',
         output_modalities: ['audio'],
         instructions: instr,
+        tools: [END_CALL_TOOL],
+        tool_choice: 'auto',
         audio: {
           input: {
             format: { type: 'audio/pcmu' },
-            transcription: callLang.toLowerCase() === 'auto'
-              ? { model: 'gpt-4o-mini-transcribe', prompt: 'The speaker uses Vietnamese or English.' }
-              : { model: 'gpt-4o-mini-transcribe', language: callLang === 'en' ? 'en' : 'vi' },
+            transcription: { model: 'gpt-4o-mini-transcribe', language: callLang === 'en' ? 'en' : 'vi' },
             turn_detection: TURN_DETECTION === 'server_vad'
               ? { type: 'server_vad', silence_duration_ms: Number(process.env.VAD_SILENCE_MS || 700), create_response: true, interrupt_response: true }
               : { type: 'semantic_vad', eagerness: 'high', create_response: true, interrupt_response: true }
@@ -314,23 +326,18 @@ wss.on('connection', (ws) => {
       let ev; try { ev = JSON.parse(raw.toString()); } catch { return; }
 
       if (ev.type === 'session.updated') {
-        const s = ev.session || {};
-        const inFmt = s.audio && s.audio.input && s.audio.input.format;
-        const outFmt = s.audio && s.audio.output && s.audio.output.format;
-        const td = s.audio && s.audio.input && s.audio.input.turn_detection;
-        if (!greeted && String(callLang).toLowerCase() !== 'auto') { greeted = true; try { oai.send(JSON.stringify({ type: 'response.create' })); log('[' + id + '] greeting requested'); } catch {} }
         if (!greeted) {
           greeted = true;
-          log('[' + id + '] auto mode - waiting for caller to speak first');
-          armSilence();
+          try { oai.send(JSON.stringify({ type: 'response.create' })); log('[' + id + '] greeting requested'); } catch {}
+          const s = ev.session || {};
+          const td = s.audio && s.audio.input && s.audio.input.turn_detection;
+          log('[' + id + '] session td=' + JSON.stringify(td) + ' voice=' + JSON.stringify(s.audio && s.audio.output && s.audio.output.voice) + ' tools=' + JSON.stringify((s.tools || []).map((t) => t.name)));
         }
-        log('[' + id + '] session in=' + JSON.stringify(inFmt) + ' out=' + JSON.stringify(outFmt) + ' td=' + JSON.stringify(td) + ' modalities=' + JSON.stringify(s.output_modalities) + ' voice=' + JSON.stringify(s.audio && s.audio.output && s.audio.output.voice));
         return;
       }
 
       if (ev.type === 'input_audio_buffer.speech_started') {
-        callerSpoke = true;
-        if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+        if (ending) { log('[' + id + '] caller spoke while hanging up - ignored'); return; }
         // barge-in: drop whatever Twilio is holding, cancel the model's reply
         toTwilio({ event: 'clear', streamSid });
         if (responseActive) { try { oai.send(JSON.stringify({ type: 'response.cancel' })); } catch {} }
@@ -344,15 +351,15 @@ wss.on('connection', (ws) => {
         speechStoppedAt = Date.now();
         firstAudioSent = false;
         turnNo += 1;
-        log('[' + id + '] TURN ' + turnNo + ' caller_stop t=' + new Date(speechStoppedAt).toISOString());
+        log('[' + id + '] TURN ' + turnNo + ' caller_stop');
         return;
       }
 
       // GA event name is response.output_audio.delta; beta used response.audio.delta. Accept both.
       if ((ev.type === 'response.output_audio.delta' || ev.type === 'response.audio.delta') && ev.delta) {
+        if (ending) return; // after the goodbye, nothing more goes to the caller
         if (!firstAudioSent) {
           firstAudioSent = true;
-          firstAudioAt = Date.now();
           const gap = speechStoppedAt ? Date.now() - speechStoppedAt : -1;
           log('[' + id + '] TURN ' + turnNo + ' first_audio_after_caller_stop=' + gap + 'ms');
         }
@@ -360,50 +367,71 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      if (ev.type === 'response.created' || ev.type === 'response.done') {
-        responseActive = ev.type === 'response.created';
-        const r = ev.response || {};
-        log('[' + id + '] ' + ev.type + ' status=' + (r.status || '?') + ' outputs=' + JSON.stringify((r.output || []).map((o) => o.type)));
-        return;
-      }
-
-      if (ev.type === 'response.audio_transcript.delta' || ev.type === 'response.output_audio_transcript.delta') {
-        log('[' + id + '] transcript_delta ' + JSON.stringify((ev.delta || '').slice(0, 60)));
-        return;
-      }
-
-      if (ev.type === 'conversation.item.input_audio_transcription.completed') {
-        const said = (ev.transcript || '').trim();
-        if (said) {
-          log('[' + id + '] caller_said ' + JSON.stringify(said.slice(0, 140)) + (speechStoppedAt ? ' [transcript +' + (Date.now() - speechStoppedAt) + 'ms after caller_stop]' : ''));
-          const dlang = detectLang(said);
-          if (dlang && dlang !== callerLang) {
-            log('[' + id + '] LANG ' + (callerLang || '(none)') + ' -> ' + dlang + ' at turn ' + turnNo);
-            callerLang = dlang;
-            const instr3 = buildInstructions({ lang: callLang, style: callStyle, address: currentAddress, opening: callOpening, task: callTask, details: callDetails, defaults: callDefaults, forcedLang: callerLang });
-            try { oai.send(JSON.stringify({ type: 'session.update', session: { type: 'realtime', instructions: instr3 } })); log('[' + id + '] LANG repinned pin=' + (callerLang === 'en' ? 'en' : 'neutral') + ' instructions_len=' + instr3.length); } catch (e) {}
-          }
-          const det = detectAddress(said);
-          if (det && det !== currentAddress) {
-            log('[' + id + '] ADDRESS ' + (currentAddress || '(none)') + ' -> ' + det + ' at turn ' + turnNo);
-            currentAddress = det;
-            const instr2 = buildInstructions({ lang: callLang, style: callStyle, address: currentAddress, opening: callOpening, task: callTask, details: callDetails, defaults: callDefaults, forcedLang: callerLang });
-            try { oai.send(JSON.stringify({ type: 'session.update', session: { type: 'realtime', instructions: instr2 } })); } catch (e) {}
-          }
-        }
-        return;
-      }
-
+      // Her words, as text (one handler only).
       if (ev.type === 'response.output_audio_transcript.delta' || ev.type === 'response.audio_transcript.delta') {
-        herText += (ev.delta || '');
-        if (!needsApproval && herText.indexOf('hỏi lại') !== -1) {
+        const d = ev.delta || '';
+        turnText += d;
+        herText += d;
+        if (!needsApproval && (herText.indexOf('hỏi lại') !== -1 || /check and call back/i.test(herText))) {
           needsApproval = true;
           log('[' + id + '] NEEDS_APPROVAL - she deferred instead of agreeing');
         }
         return;
       }
+
+      if (ev.type === 'response.created') {
+        responseActive = true;
+        turnText = '';
+        return;
+      }
+
+      if (ev.type === 'response.done') {
+        responseActive = false;
+        const r = ev.response || {};
+        const outputs = r.output || [];
+        if (turnText.trim()) log('[' + id + '] linh_said ' + JSON.stringify(turnText.trim().slice(0, 300)));
+        else log('[' + id + '] response.done status=' + (r.status || '?') + ' outputs=' + JSON.stringify(outputs.map((o) => o.type)));
+        turnText = '';
+
+        const wantsHangup = outputs.some((o) => o.type === 'function_call' && o.name === 'end_call');
+        if (wantsHangup && !ending) {
+          ending = true;
+          // Ask Twilio to tell us when the goodbye has finished playing.
+          toTwilio({ event: 'mark', streamSid, mark: { name: 'linh-goodbye' } });
+          hangupTimer = setTimeout(() => hangUp('fallback timer'), HANGUP_FALLBACK_MS);
+          log('[' + id + '] end_call requested - waiting for goodbye to finish playing');
+        }
+        return;
+      }
+
+      if (ev.type === 'conversation.item.input_audio_transcription.completed') {
+        const said = (ev.transcript || '').trim();
+        if (!said) return;
+        log('[' + id + '] caller_said ' + JSON.stringify(said.slice(0, 140)));
+        let changed = false;
+        const dlang = detectLang(said);
+        if (dlang && dlang !== callerLang) {
+          log('[' + id + '] LANG ' + (callerLang || '(none)') + ' -> ' + dlang + ' at turn ' + turnNo);
+          // Only English switches the instructions; Vietnamese is already the default.
+          if (dlang === 'en' || callerLang === 'en') changed = true;
+          callerLang = dlang;
+        }
+        const det = detectAddress(said);
+        if (det && det !== currentAddress) {
+          log('[' + id + '] ADDRESS ' + (currentAddress || '(none)') + ' -> ' + det + ' at turn ' + turnNo);
+          currentAddress = det;
+          changed = true;
+        }
+        if (changed && !ending) {
+          try { oai.send(JSON.stringify({ type: 'session.update', session: { type: 'realtime', instructions: instrFor(false) } })); } catch {}
+        }
+        return;
+      }
+
       if (ev.type === 'error') {
-        log('[' + id + '] openai error ' + JSON.stringify(ev.error || {}).slice(0, 200));
+        const e = ev.error || {};
+        if (e.code === 'response_cancel_not_active') return; // harmless race on barge-in
+        log('[' + id + '] openai error ' + JSON.stringify(e).slice(0, 200));
       }
     });
 
@@ -424,7 +452,7 @@ wss.on('connection', (ws) => {
       callVoice = cp.voice || '';
       callLang = cp.lang || 'vi';
       if (String(callLang).toLowerCase() === 'auto' && process.env.REALTIME_AUTO_EXPERIMENT !== '1') {
-        log('[' + id + '] lang=auto is experimental and disabled - using vi persona');
+        log('[' + id + '] lang=auto is experimental and disabled - using vi');
         callLang = 'vi';
       }
       callAddress = cp.address || '';
@@ -434,33 +462,38 @@ wss.on('connection', (ws) => {
       callDetails = cp.details || '';
       callDefaults = cp.defaults || '';
       callStyle = cp.style || '';
-      log('[' + id + '] voice_override=' + (callVoice || '(default)') + ' style=' + (callStyle ? 'custom' : '(default)'));
-      log('[' + id + '] start stream=' + streamSid + ' call=' + s.callSid + ' format=' + JSON.stringify(s.mediaFormat));
+      log('[' + id + '] start call=' + s.callSid + ' voice=' + (callVoice || '(default)') + ' style=' + (callStyle ? 'custom' : '(default)') + ' mode=' + (callTask ? 'task' : 'chat'));
       if (!twilioLeg.endsWith(TWILIO_NUMBER.replace('+', '')) && twilioLeg !== TWILIO_NUMBER) {
-        log('[' + id + '] REJECT call — twilio number not on this stream (' + (twilioLeg || 'none') + ')');
+        log('[' + id + '] REJECT call - twilio number not on this stream (' + (twilioLeg || 'none') + ')');
         try { ws.close(1008, 'twilio-number-not-allowed'); } catch {}
         return;
       }
       // outbound only: Twilio reports the dialled number as customParameters.to
-      const toLeg = String(cp.to || '');
       const digitOnly = (v) => String(v || '').replace(/[^0-9]/g, '');
-      if (digitOnly(toLeg) && digitOnly(toLeg) === digitOnly(TWILIO_NUMBER)) {
+      if (digitOnly(cp.to) && digitOnly(cp.to) === digitOnly(TWILIO_NUMBER)) {
         log('[' + id + '] REJECT call - inbound to ' + TWILIO_NUMBER + ' (outbound only)');
         try { ws.close(1008, 'inbound-not-allowed'); } catch {}
         return;
       }
       openOpenAI();
       timer = setTimeout(() => {
-        log('[' + id + '] TIME LIMIT reached — closing');
+        log('[' + id + '] TIME LIMIT reached - closing');
         try { ws.close(1000, 'time-limit'); } catch {}
       }, MAX_CALL_MS);
       return;
     }
 
     if (msg.event === 'media') {
+      if (ending) return; // stop listening once she is hanging up
       if (oai && oai.readyState === 1 && msg.media && msg.media.payload) {
         try { oai.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload })); } catch {}
       }
+      return;
+    }
+
+    // Twilio echoes our mark when the audio before it has finished playing.
+    if (msg.event === 'mark') {
+      if (ending && msg.mark && msg.mark.name === 'linh-goodbye') hangUp('goodbye finished');
       return;
     }
 
@@ -480,11 +513,10 @@ wss.on('connection', (ws) => {
 
 if (process.env.REALTIME_NO_LISTEN !== '1') server.listen(PORT, HOST, () => {
   log('listening ws://' + HOST + ':' + PORT + ' model=' + MODEL + ' voice=' + VOICE + ' td=' + TURN_DETECTION + ' twilio=' + TWILIO_NUMBER);
-  if (!AUTH_TOKEN) log('WARNING: TWILIO_AUTH_TOKEN missing — every upgrade will be rejected');
-  if (!OPENAI_KEY) log('WARNING: OPENAI_API_KEY missing — calls will fail at OpenAI');
+  if (!AUTH_TOKEN) log('WARNING: TWILIO_AUTH_TOKEN missing - every upgrade will be rejected');
+  if (!OPENAI_KEY) log('WARNING: OPENAI_API_KEY missing - calls will fail at OpenAI');
 });
 
-let shuttingDown = false;
 const shutdown = (sig) => {
   if (shuttingDown) return;
   shuttingDown = true;
