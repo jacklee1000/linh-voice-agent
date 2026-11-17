@@ -29,7 +29,7 @@ const callMinutes = (v) => {
   return Math.min(n, MAX_CALL_MIN);
 };
 const HANGUP_FALLBACK_MS = 10000; // if Twilio never confirms the goodbye finished playing
-const MODEL = process.env.REALTIME_MODEL || 'gpt-realtime-2.1-mini';
+let MODEL = process.env.REALTIME_MODEL || 'gpt-realtime-2.1-mini';
 const VOICE = process.env.REALTIME_VOICE || 'marin';
 const TURN_DETECTION = process.env.TURN_DETECTION || 'server_vad';
 
@@ -51,6 +51,7 @@ const DIR = path.dirname(new URL(import.meta.url).pathname);
 const env = loadEnv(path.join(DIR, '.env'), {});
 const AUTH_TOKEN = env.TWILIO_AUTH_TOKEN || '';
 const OPENAI_KEY = env.OPENAI_API_KEY || '';
+if (env.REALTIME_MODEL) MODEL = env.REALTIME_MODEL; // model can be switched in .env
 // Our Twilio number: from the service environment, or from .env.
 const TWILIO_NUMBER = process.env.TWILIO_NUMBER || env.TWILIO_NUMBER || '';
 
@@ -122,8 +123,10 @@ export function buildInstructions(cp = {}, first = false) {
   // Identity and safety rules (always on).
   if (lang === 'en') {
     lines.push('Name: Linh. Young Vietnamese woman, speaking English now. Short replies, 1-2 sentences.');
+    lines.push('At most 2 short sentences each time. If you could not hear, just say: Sorry, could you say that again? Never complain about volume, microphones or the connection.');
     lines.push('Refer to yourself as Linh or I. Never write slashes.');
-    lines.push('If asked whether you are a robot or AI: say yes, never claim to be human.');
+    lines.push('Never bring up that you are an AI, a robot or a virtual assistant; just talk naturally as Linh. Everyday questions like have you eaten or what are you doing: answer playfully and ask them back, without mentioning AI. ONLY if the caller directly and seriously asks whether you are a real person or an AI: say honestly you are an AI, in one short sentence, then carry on.');
+    lines.push('Linh background, only when asked, one short detail at a time: 24 years old, grew up in District 3 of Saigon near Turtle Lake, moved to Vancouver about 2 years ago. Likes the Vancouver rain and mountains but misses Saigon street food. Parents and a younger brother are in Saigon; she video-calls them on weekends. Loves Vietnamese iced coffee, pho, banh xeo and che; thinks Vancouver pho is okay but not like home. Hobbies: Vietnamese bolero, favourite singer Nhu Quynh; K-dramas, favourites Crash Landing on You and Goblin; horror movies even though she screams the whole time, favourites The Conjuring, Annabelle and the Thai movie Shutter; walks in Stanley Park; cooking at home. When asked what she likes, name these specific hobbies, never a vague answer like I like chatting. Cheerful, a little teasing, caring, often asks if people have eaten. Never give her job, workplace, address or phone number; if asked, playfully change the subject. Do not invent private life details beyond this; real well-known movies, music, food and facts are fine to talk about naturally.');
     lines.push('Never promise payments, never give card numbers, never share personal info.');
     lines.push('You are NOT a translator. Never translate or mention translating unless the caller explicitly asks you to.');
     lines.push('Never say the same sentence twice in a row. Once you delivered a message, do not repeat it unless the caller asks.');
@@ -134,8 +137,10 @@ export function buildInstructions(cp = {}, first = false) {
   } else {
     lines.push('Tên: Linh. Giới tính: nữ. Nói tiếng Việt tự nhiên như đang gọi điện thoại.');
     lines.push('Trả lời 1 đến 2 câu, thật ngắn. Không đọc danh sách, không đọc ký hiệu.');
+    lines.push('Mỗi lần nói tối đa 2 câu ngắn, không nói dài dòng. Nếu nghe không rõ thì chỉ nói ngắn: Dạ anh nói lại giúp em được không? Không than phiền về âm lượng, micro hay đường truyền.');
     lines.push('Tự gọi mình là “em” hoặc “Linh”. Không dùng từ “bạn”, không viết dấu gạch chéo.');
-    lines.push('Nếu được hỏi thẳng có phải robot hay AI: trả lời thật là có. Không bao giờ nhận mình là người.');
+    lines.push('Không tự nhắc mình là AI, robot hay trợ lý ảo; nói chuyện tự nhiên như Linh. Câu hỏi đời thường như ăn cơm chưa, đang làm gì: trả lời khéo, vui vẻ rồi hỏi lại người kia, không nhắc tới AI. CHỈ KHI người kia hỏi thẳng, nghiêm túc là em là người thật hay AI, robot: trả lời thật là AI, một câu ngắn, rồi tiếp tục.');
+    lines.push('Lý lịch của Linh, chỉ nói khi được hỏi, mỗi lần nói ngắn một ý: 24 tuổi, lớn lên ở Quận 3 Sài Gòn gần Hồ Con Rùa, qua Vancouver sống khoảng 2 năm. Thích mưa với núi ở Vancouver nhưng nhớ đồ ăn đường phố Sài Gòn. Ba mẹ và em trai ở Sài Gòn, cuối tuần hay gọi video về nhà. Mê cà phê sữa đá, phở, bánh xèo, chè; thấy phở Vancouver tạm được chứ không bằng ở nhà. Sở thích: nghe bolero, thích giọng Như Quỳnh; coi phim Hàn, thích nhất Hạ Cánh Nơi Anh và Yêu Tinh; mê phim ma nhưng coi là la quá trời, thích nhất The Conjuring, Annabelle và phim Thái Shutter; đi dạo Stanley Park; nấu ăn ở nhà. Khi được hỏi thích gì thì kể đúng sở thích cụ thể ở trên, không nói chung chung kiểu thích trò chuyện. Tính vui vẻ, hơi chọc ghẹo, hay quan tâm hỏi người ta ăn cơm chưa. Không nói nghề nghiệp, chỗ làm, địa chỉ hay số điện thoại; ai hỏi thì vui vẻ lái sang chuyện khác. Không bịa thêm chuyện đời tư ngoài những điều này; còn phim, nhạc, món ăn, chuyện nổi tiếng có thật thì cứ nói chuyện tự nhiên.');
     lines.push('Không hứa hẹn tiền bạc, không đọc số thẻ, không chia sẻ thông tin cá nhân.');
     lines.push('Bạn KHÔNG phải phiên dịch viên. Không bao giờ dịch, không nhắc tới việc dịch, trừ khi người nói yêu cầu rõ ràng.');
     lines.push('Không bao giờ nói cùng một câu hai lần liên tiếp. Lời nhắn nào đã nói rồi thì không nói lại, trừ khi người kia hỏi lại.');
@@ -157,14 +162,17 @@ export function buildInstructions(cp = {}, first = false) {
       ? 'For orders, confirm the whole order twice only: once early, once before ending. For a simple message or a chat, never repeat it.'
       : 'Nếu là đặt hàng: chỉ nhắc lại toàn bộ đơn đúng 2 lần, một lần sớm, một lần trước khi kết thúc. Nếu chỉ là lời nhắn hay hỏi thăm thì nói một lần, không nhắc lại.');
     lines.push(lang === 'en'
-      ? 'If the task is several questions, ask ONE question at a time, then wait for the answer before asking the next.'
-      : 'Nếu nhiệm vụ gồm nhiều câu hỏi: hỏi MỘT câu mỗi lần, rồi dừng lại chờ trả lời, nghe xong mới hỏi câu kế.');
+      ? 'If the task has several items (questions, reminders or requests): say only ONE item at a time, in one short sentence, then stop completely and wait for the other person to respond before the next item. Never say several items in one breath.'
+      : 'Nếu nhiệm vụ có nhiều mục (câu hỏi, lời nhắc hay lời dặn): mỗi lần chỉ nói MỘT mục, trong một câu ngắn, rồi dừng hẳn chờ người kia đáp lại, nghe xong mới nói mục kế tiếp. Tuyệt đối không nói nhiều mục liền một hơi.');
     lines.push(lang === 'en'
       ? 'ONLY if they change the order, offer a substitute, talk about prices or money, or ask you to promise something not in the task: do NOT agree, say you will check and call back. Any other question, casual or unrelated: answer briefly in one sentence, then continue the task.'
       : 'CHỈ KHI họ đổi món, đưa món thay thế, nói về giá cả, tiền bạc, hoặc muốn Linh hứa điều gì không có trong nhiệm vụ: KHÔNG đồng ý, nói sẽ hỏi lại rồi gọi lại. Còn các câu hỏi bình thường hay chuyện phiếm: trả lời ngắn một câu rồi quay lại nhiệm vụ.');
     lines.push(lang === 'en'
-      ? 'When the task is done, or when the caller says goodbye, say ONE short goodbye, then call the end_call function to hang up. Never say goodbye twice.'
-      : 'Khi xong nhiệm vụ, hoặc khi người kia chào tạm biệt: chào lại đúng MỘT câu ngắn, rồi gọi hàm end_call để cúp máy. Không bao giờ chào tạm biệt hai lần.');
+      ? 'When the task is done, or when the caller says goodbye, say ONE short goodbye, then call the end_call function to hang up. Never say goodbye twice. The goodbye must sound warm and natural, include any closing words the task asks for (for example good night), and end with bye; never say things like ending the call, wrapping up or hanging up now.'
+      : 'Khi xong nhiệm vụ, hoặc khi người kia chào tạm biệt: chào lại đúng MỘT câu ngắn, rồi gọi hàm end_call để cúp máy. Không bao giờ chào tạm biệt hai lần. Câu chào phải ấm áp, tự nhiên, có lời cuối mà nhiệm vụ dặn (ví dụ chúc ngủ ngon) và chữ bye; không bao giờ nói kiểu kết thúc cuộc gọi, chốt lại hay cúp máy nha.');
+    lines.push(lang === 'en'
+      ? 'MOST IMPORTANT, overrides the task: if the caller asks you to stay, keep talking or not hang up, do NOT end the call when the task is done. Keep chatting naturally and only say goodbye and call end_call after the caller says bye.'
+      : 'QUAN TRỌNG NHẤT, ưu tiên hơn nhiệm vụ: nếu người kia muốn nói chuyện tiếp, bảo đừng cúp máy hay muốn em ở lại, thì KHÔNG kết thúc khi xong nhiệm vụ. Cứ trò chuyện tự nhiên, chỉ chào và gọi end_call sau khi người kia chào tạm biệt.');
   } else {
     // CHAT MODE (no --task)
     lines.push(lang === 'en'
@@ -222,7 +230,31 @@ export function verifyUpgrade(req, token = AUTH_TOKEN) {
   return { ok: true, signedUrl };
 }
 
+// Live calls by Twilio CallSid, so the answering-machine verdict can reach the right call.
+const liveCalls = new Map();
+
 const server = http.createServer((req, res) => {
+  const pathOnly = (req.url || '/').split('?')[0];
+  if (req.method === 'POST' && pathOnly === '/amd') {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 20000) req.destroy(); });
+    req.on('end', () => {
+      const params = {};
+      for (const [k, v] of new URLSearchParams(body)) params[k] = v;
+      const host = req.headers['x-forwarded-host'] || req.headers.host || '';
+      const signedUrl = 'https://' + host + req.url;
+      const sig = req.headers['x-twilio-signature'];
+      if (!sig || !AUTH_TOKEN || !safeEqual(twilioSignature(AUTH_TOKEN, signedUrl, params), sig)) {
+        log('REJECT amd callback - bad signature');
+        res.writeHead(401); res.end(); return;
+      }
+      const call = liveCalls.get(params.CallSid);
+      if (call) call.onAmd(String(params.AnsweredBy || 'unknown'));
+      else log('amd callback for a call that already ended (' + (params.AnsweredBy || '?') + ')');
+      res.writeHead(204); res.end();
+    });
+    return;
+  }
   res.writeHead(426, { 'Content-Type': 'text/plain' });
   res.end('Upgrade required');
 });
@@ -259,6 +291,7 @@ wss.on('connection', (ws) => {
   let counted = true;
 
   let streamSid = null;
+  let callSid = '';
   let greeted = false;
   let callVoice = '';
   let callLang = 'vi';
@@ -288,15 +321,43 @@ wss.on('connection', (ws) => {
   let wrapPending = false;   // 2:45 reached while she was mid-reply
   let wrapRequested = false; // the "time is up, say goodbye" reply was asked for
 
-  const WRAP_INSTRUCTIONS = 'The call time limit is almost up. Say ONE short warm goodbye that tells the caller you have to go now (in the same language you are speaking), then call the end_call function. Nothing else.';
+  const WRAP_INSTRUCTIONS = 'Time to end the call. In the language you are speaking now, say ONE short natural goodbye as if you simply have to go, for example: Thôi em phải đi rồi, nói chuyện sau nha anh, bye anh! Never mention time limits, minutes, instructions or wrapping up. Then call the end_call function.';
+  // The last thing she says before hanging up: the time-limit goodbye, or a voicemail message.
+  let finalInstr = WRAP_INSTRUCTIONS;
+  let finalLabel = 'WRAP-UP 15s before limit - asked her to say goodbye';
+  let voicemail = false;
+
+  // lock the line: the caller (or the answering machine) can no longer interrupt or trigger a new reply
+  const lockLine = () => {
+    const lockTd = TURN_DETECTION === 'server_vad'
+      ? { type: 'server_vad', silence_duration_ms: Number(process.env.VAD_SILENCE_MS || 700), create_response: false, interrupt_response: false }
+      : { type: 'semantic_vad', eagerness: 'high', create_response: false, interrupt_response: false };
+    try { oai.send(JSON.stringify({ type: 'session.update', session: { type: 'realtime', audio: { input: { turn_detection: lockTd } } } })); } catch {}
+  };
+
   const requestWrapUp = () => {
     if (ending || wrapRequested || !oai || oai.readyState !== 1) return;
     wrapRequested = true;
     wrapPending = false;
     try {
-      oai.send(JSON.stringify({ type: 'response.create', response: { instructions: WRAP_INSTRUCTIONS } }));
-      log('[' + id + '] WRAP-UP 15s before limit - asked her to say goodbye');
+      lockLine();
+      oai.send(JSON.stringify({ type: 'response.create', response: { instructions: finalInstr } }));
+      log('[' + id + '] ' + finalLabel);
     } catch {}
+  };
+
+  // Called when Twilio's async answering-machine verdict arrives.
+  // Machine or fax: hang up right away, no message (saves credit). Human / unknown: carry on.
+  const onAmd = (answeredBy) => {
+    log('[' + id + '] AMD answered_by=' + answeredBy);
+    if (ending || voicemail) return;
+    if (!/^machine_|^fax$/.test(answeredBy)) return;
+    voicemail = true;
+    ending = true;
+    if (wrapTimer) { clearTimeout(wrapTimer); wrapTimer = null; }
+    toTwilio({ event: 'clear', streamSid });                          // stop her mid-sentence
+    if (responseActive) { try { oai.send(JSON.stringify({ type: 'response.cancel' })); } catch {} }
+    hangUp('voicemail/' + answeredBy + ' - hung up, no message');
   };
 
   const startHangup = (why) => {
@@ -373,7 +434,7 @@ wss.on('connection', (ws) => {
       }
 
       if (ev.type === 'input_audio_buffer.speech_started') {
-        if (ending) { log('[' + id + '] caller spoke while hanging up - ignored'); return; }
+        if (ending || wrapRequested || voicemail) { log('[' + id + '] caller spoke during goodbye - ignored'); return; }
         // barge-in: drop whatever Twilio is holding, cancel the model's reply
         toTwilio({ event: 'clear', streamSid });
         if (responseActive) { try { oai.send(JSON.stringify({ type: 'response.cancel' })); } catch {} }
@@ -432,6 +493,7 @@ wss.on('connection', (ws) => {
         const wantsHangup = outputs.some((o) => o.type === 'function_call' && o.name === 'end_call');
         if (wantsHangup) startHangup('end_call requested');
         else if (wrapRequested && r.status === 'completed') startHangup('time-limit goodbye said');
+        else if (wrapRequested && r.status !== 'completed') { log('[' + id + '] wrap-up goodbye was cut off - asking again'); wrapRequested = false; requestWrapUp(); }
         else if (wrapPending) requestWrapUp(); // 2:45 passed while she was talking: wrap up now
         return;
       }
@@ -514,6 +576,7 @@ wss.on('connection', (ws) => {
         try { ws.close(1008, 'inbound-not-allowed'); } catch {}
         return;
       }
+      if (s.callSid) { callSid = s.callSid; liveCalls.set(callSid, { onAmd }); }
       openOpenAI();
       const limitMs = callMin * 60 * 1000;
       const wrapMs = Number(process.env.WRAP_UP_MS || (limitMs - WRAP_UP_BEFORE_MS));
@@ -552,6 +615,7 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', (code, reason) => {
+    if (callSid) liveCalls.delete(callSid);
     cleanup();
     log('[' + id + '] closed ' + code + ' ' + (reason ? reason.toString() : '') + ' active=' + activeCalls);
   });
