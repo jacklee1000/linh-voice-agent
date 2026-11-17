@@ -3,7 +3,7 @@
 // Security:
 //   1. X-Twilio-Signature verified on the WS upgrade
 //   2. the Twilio number must be present in customParameters
-//   3. outbound only, one call at a time, 180s hard cap
+//   3. outbound only, one call at a time, time cap (default 3 min, --minutes up to MAX_CALL_MIN)
 //
 // Nov 2026 update:
 //   - Linh can hang up herself (end_call tool + Twilio mark)
@@ -20,8 +20,14 @@ const { WebSocketServer, WebSocket } = wsPkg;
 
 const PORT = Number(process.env.PORT || 8090);
 const HOST = process.env.HOST || '127.0.0.1';
-const TWILIO_NUMBER = process.env.TWILIO_NUMBER || '';
-const MAX_CALL_MS = 3 * 60 * 1000;
+const DEFAULT_CALL_MIN = 3;                                  // used when --minutes is not given
+const MAX_CALL_MIN = Number(process.env.MAX_CALL_MIN || 30); // safety ceiling, whatever --minutes says
+const WRAP_UP_BEFORE_MS = 15 * 1000;                          // she says goodbye 15s before the limit
+const callMinutes = (v) => {
+  const n = Math.round(Number(v));
+  if (!n || n < 1) return DEFAULT_CALL_MIN;
+  return Math.min(n, MAX_CALL_MIN);
+};
 const HANGUP_FALLBACK_MS = 10000; // if Twilio never confirms the goodbye finished playing
 const MODEL = process.env.REALTIME_MODEL || 'gpt-realtime-2.1-mini';
 const VOICE = process.env.REALTIME_VOICE || 'marin';
@@ -45,6 +51,8 @@ const DIR = path.dirname(new URL(import.meta.url).pathname);
 const env = loadEnv(path.join(DIR, '.env'), {});
 const AUTH_TOKEN = env.TWILIO_AUTH_TOKEN || '';
 const OPENAI_KEY = env.OPENAI_API_KEY || '';
+// Our Twilio number: from the service environment, or from .env.
+const TWILIO_NUMBER = process.env.TWILIO_NUMBER || env.TWILIO_NUMBER || '';
 
 const STYLE = 'Giọng nói trẻ trung, vui vẻ, dễ thương, nhẹ nhàng, tự nhiên như cô gái miền Nam, hơi tươi cười.';
 
@@ -93,6 +101,7 @@ export function buildInstructions(cp = {}, first = false) {
   const forced = (cp.forcedLang === 'en') ? 'en' : null;
   const lang = forced || (langRaw === 'en' ? 'en' : 'vi');
   const style = cp.style || STYLE;
+  const mins = cp.maxMin || DEFAULT_CALL_MIN;
   const lines = [];
 
   // AUTO language mode (experimental, off unless REALTIME_AUTO_EXPERIMENT=1).
@@ -118,6 +127,7 @@ export function buildInstructions(cp = {}, first = false) {
     lines.push('Never promise payments, never give card numbers, never share personal info.');
     lines.push('You are NOT a translator. Never translate or mention translating unless the caller explicitly asks you to.');
     lines.push('Never say the same sentence twice in a row. Once you delivered a message, do not repeat it unless the caller asks.');
+    lines.push('This call lasts at most ' + mins + ' minutes. If asked how long you can talk, say honestly about ' + mins + ' minutes.');
     lines.push(cp.address
       ? 'Never insert Vietnamese kinship words (anh, chị, em, cô, chú, bác) into English sentences. Address the caller by name if you know it, otherwise leave the address term out.'
       : 'Do not guess how to address the caller until they refer to themselves.');
@@ -129,6 +139,7 @@ export function buildInstructions(cp = {}, first = false) {
     lines.push('Không hứa hẹn tiền bạc, không đọc số thẻ, không chia sẻ thông tin cá nhân.');
     lines.push('Bạn KHÔNG phải phiên dịch viên. Không bao giờ dịch, không nhắc tới việc dịch, trừ khi người nói yêu cầu rõ ràng.');
     lines.push('Không bao giờ nói cùng một câu hai lần liên tiếp. Lời nhắn nào đã nói rồi thì không nói lại, trừ khi người kia hỏi lại.');
+    lines.push('Cuộc gọi này dài tối đa ' + mins + ' phút. Nếu được hỏi nói chuyện được bao lâu, trả lời thật là khoảng ' + mins + ' phút.');
     lines.push(cp.address
       ? 'Gọi người nói chuyện là “' + cp.address + '”, nhưng nếu họ tự xưng khác thì đổi ngay và giữ nguyên.'
       : 'Chưa biết thì đừng đoán cách gọi; khi họ tự xưng thì theo đúng như vậy.');
@@ -260,6 +271,7 @@ wss.on('connection', (ws) => {
   let callDetails = '';
   let callDefaults = '';
   let callStyle = '';
+  let callMin = DEFAULT_CALL_MIN;
   let oai = null;
   let timer = null;
   let speechStoppedAt = 0;
@@ -272,12 +284,35 @@ wss.on('connection', (ws) => {
 
   let ending = false;     // true once she called end_call
   let hangupTimer = null;
+  let wrapTimer = null;
+  let wrapPending = false;   // 2:45 reached while she was mid-reply
+  let wrapRequested = false; // the "time is up, say goodbye" reply was asked for
+
+  const WRAP_INSTRUCTIONS = 'The call time limit is almost up. Say ONE short warm goodbye that tells the caller you have to go now (in the same language you are speaking), then call the end_call function. Nothing else.';
+  const requestWrapUp = () => {
+    if (ending || wrapRequested || !oai || oai.readyState !== 1) return;
+    wrapRequested = true;
+    wrapPending = false;
+    try {
+      oai.send(JSON.stringify({ type: 'response.create', response: { instructions: WRAP_INSTRUCTIONS } }));
+      log('[' + id + '] WRAP-UP 15s before limit - asked her to say goodbye');
+    } catch {}
+  };
+
+  const startHangup = (why) => {
+    if (ending) return;
+    ending = true;
+    // Ask Twilio to tell us when the goodbye has finished playing.
+    toTwilio({ event: 'mark', streamSid, mark: { name: 'linh-goodbye' } });
+    hangupTimer = setTimeout(() => hangUp('fallback timer'), HANGUP_FALLBACK_MS);
+    log('[' + id + '] ' + why + ' - waiting for goodbye to finish playing');
+  };
 
   const toTwilio = (obj) => { try { ws.send(JSON.stringify(obj)); } catch {} };
 
   const instrFor = (first) => buildInstructions({
     lang: callLang, style: callStyle, address: currentAddress, opening: callOpening,
-    task: callTask, details: callDetails, defaults: callDefaults, forcedLang: callerLang
+    task: callTask, details: callDetails, defaults: callDefaults, forcedLang: callerLang, maxMin: callMin
   }, first);
 
   const hangUp = (why) => {
@@ -288,6 +323,7 @@ wss.on('connection', (ws) => {
 
   const cleanup = () => {
     if (timer) { clearTimeout(timer); timer = null; }
+    if (wrapTimer) { clearTimeout(wrapTimer); wrapTimer = null; }
     if (hangupTimer) { clearTimeout(hangupTimer); hangupTimer = null; }
     if (oai && oai.readyState === 1) { try { oai.close(); } catch {} }
     if (counted) { counted = false; activeCalls -= 1; }
@@ -394,13 +430,9 @@ wss.on('connection', (ws) => {
         turnText = '';
 
         const wantsHangup = outputs.some((o) => o.type === 'function_call' && o.name === 'end_call');
-        if (wantsHangup && !ending) {
-          ending = true;
-          // Ask Twilio to tell us when the goodbye has finished playing.
-          toTwilio({ event: 'mark', streamSid, mark: { name: 'linh-goodbye' } });
-          hangupTimer = setTimeout(() => hangUp('fallback timer'), HANGUP_FALLBACK_MS);
-          log('[' + id + '] end_call requested - waiting for goodbye to finish playing');
-        }
+        if (wantsHangup) startHangup('end_call requested');
+        else if (wrapRequested && r.status === 'completed') startHangup('time-limit goodbye said');
+        else if (wrapPending) requestWrapUp(); // 2:45 passed while she was talking: wrap up now
         return;
       }
 
@@ -431,6 +463,12 @@ wss.on('connection', (ws) => {
       if (ev.type === 'error') {
         const e = ev.error || {};
         if (e.code === 'response_cancel_not_active') return; // harmless race on barge-in
+        if (e.code === 'conversation_already_has_active_response' && wrapRequested && !ending) {
+          // the wrap-up collided with a reply that just started: retry after it
+          wrapRequested = false;
+          wrapPending = true;
+          return;
+        }
         log('[' + id + '] openai error ' + JSON.stringify(e).slice(0, 200));
       }
     });
@@ -462,7 +500,8 @@ wss.on('connection', (ws) => {
       callDetails = cp.details || '';
       callDefaults = cp.defaults || '';
       callStyle = cp.style || '';
-      log('[' + id + '] start call=' + s.callSid + ' voice=' + (callVoice || '(default)') + ' style=' + (callStyle ? 'custom' : '(default)') + ' mode=' + (callTask ? 'task' : 'chat'));
+      callMin = callMinutes(cp.maxmin);
+      log('[' + id + '] start call=' + s.callSid + ' voice=' + (callVoice || '(default)') + ' style=' + (callStyle ? 'custom' : '(default)') + ' mode=' + (callTask ? 'task' : 'chat') + ' limit=' + callMin + 'min');
       if (!twilioLeg.endsWith(TWILIO_NUMBER.replace('+', '')) && twilioLeg !== TWILIO_NUMBER) {
         log('[' + id + '] REJECT call - twilio number not on this stream (' + (twilioLeg || 'none') + ')');
         try { ws.close(1008, 'twilio-number-not-allowed'); } catch {}
@@ -476,10 +515,18 @@ wss.on('connection', (ws) => {
         return;
       }
       openOpenAI();
+      const limitMs = callMin * 60 * 1000;
+      const wrapMs = Number(process.env.WRAP_UP_MS || (limitMs - WRAP_UP_BEFORE_MS));
+      wrapTimer = setTimeout(() => {
+        wrapTimer = null;
+        if (ending) return;
+        if (responseActive) { wrapPending = true; log('[' + id + '] wrap-up time reached mid-reply - goodbye after this reply'); }
+        else requestWrapUp();
+      }, wrapMs);
       timer = setTimeout(() => {
         log('[' + id + '] TIME LIMIT reached - closing');
         try { ws.close(1000, 'time-limit'); } catch {}
-      }, MAX_CALL_MS);
+      }, limitMs);
       return;
     }
 
