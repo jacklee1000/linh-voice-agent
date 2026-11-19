@@ -65,6 +65,41 @@ const END_CALL_TOOL = {
   parameters: { type: 'object', properties: {} }
 };
 
+// The tool Linh uses to press phone keys in an automated menu ("press 1 for...").
+const PRESS_KEYS_TOOL = {
+  type: 'function',
+  name: 'press_keys',
+  description: 'Press keys on the phone keypad, for automated phone menus. Use only when a recorded menu asks you to press a key.',
+  parameters: { type: 'object', properties: { digits: { type: 'string', description: 'Keys to press, for example "1" or "2#". Only 0-9, * and #.' } }, required: ['digits'] }
+};
+
+// DTMF: each key is two tones mixed together, sent as normal call audio (8 kHz mu-law).
+const DTMF_FREQ = { '1': [697, 1209], '2': [697, 1336], '3': [697, 1477], '4': [770, 1209], '5': [770, 1336], '6': [770, 1477], '7': [852, 1209], '8': [852, 1336], '9': [852, 1477], '*': [941, 1209], '0': [941, 1336], '#': [941, 1477] };
+function linearToMulaw(sample) {
+  const BIAS = 0x84, CLIP = 32635;
+  let sign = (sample >> 8) & 0x80;
+  if (sign) sample = -sample;
+  if (sample > CLIP) sample = CLIP;
+  sample += BIAS;
+  let exponent = 7;
+  for (let mask = 0x4000; (sample & mask) === 0 && exponent > 0; exponent--, mask >>= 1);
+  const mantissa = (sample >> (exponent + 3)) & 0x0f;
+  return (~(sign | (exponent << 4) | mantissa)) & 0xff;
+}
+export function dtmfMulaw(digits, toneMs = 160, gapMs = 120) {
+  const sr = 8000, out = [];
+  for (const d of String(digits)) {
+    const f = DTMF_FREQ[d];
+    if (!f) continue;
+    for (let i = 0; i < sr * toneMs / 1000; i++) {
+      const v = 0.32 * Math.sin(2 * Math.PI * f[0] * i / sr) + 0.32 * Math.sin(2 * Math.PI * f[1] * i / sr);
+      out.push(linearToMulaw(Math.round(v * 32767)));
+    }
+    for (let i = 0; i < sr * gapMs / 1000; i++) out.push(linearToMulaw(0));
+  }
+  return Buffer.from(out);
+}
+
 // Vietnamese pronouns a caller may use for themselves, with self-reference verbs.
 const ADDRESS_WORDS = ['anh', 'chị', 'cô', 'chú', 'bác', 'ông', 'bà'];
 const SELF_VERBS = ['nói', 'hỏi', 'muốn', 'cần', 'đặt', 'lấy', 'gọi', 'nghe', 'đây', 'tên', 'trả', 'đợi', 'chờ', 'sẽ', 'có', 'là', 'đi', 'qua', 'mang', 'ăn'];
@@ -186,8 +221,18 @@ export function buildInstructions(cp = {}, first = false) {
       : 'Không tự kết thúc cuộc gọi. Chỉ khi người kia chào tạm biệt: chào lại đúng MỘT câu ngắn, rồi gọi hàm end_call để cúp máy.');
   }
 
+  if (cp.menu) {
+    lines.push(lang === 'en'
+      ? 'This call may start with an automated phone menu or a recording. Listen to the whole list of options before choosing. When the menu asks you to press a key, pick the option that fits your task and use the press_keys function with that digit. If the menu asks you to say something, say only that word. Never chat with a recording, music or a hold message: stay silent and wait. When a real person answers, greet them briefly and do the task.'
+      : 'Cuộc gọi này có thể gặp tổng đài tự động hay lời nhắn ghi âm. Nghe hết các lựa chọn rồi mới chọn. Khi tổng đài bảo bấm phím, chọn mục hợp với nhiệm vụ và gọi hàm press_keys với số đó. Nếu tổng đài bảo nói gì thì chỉ nói đúng từ đó. Không bao giờ nói chuyện với giọng ghi âm, nhạc chờ hay lời nhắn chờ máy: im lặng và chờ. Khi có người thật nghe máy thì chào ngắn rồi làm nhiệm vụ.');
+  }
+
   // Greeting: only on the first instruction block of the call.
-  if (first) {
+  if (first && cp.menu) {
+    lines.push(lang === 'en'
+      ? 'Do not speak first. Listen: if it is a menu, follow it; if a real person answers, greet them briefly and do the task.'
+      : 'Không nói trước. Lắng nghe: nếu là tổng đài thì làm theo; nếu người thật nghe máy thì chào ngắn rồi làm nhiệm vụ.');
+  } else if (first) {
     const a = cp.address || '';
     if (cp.opening) {
       lines.push(lang === 'en'
@@ -308,6 +353,7 @@ wss.on('connection', (ws) => {
   let callDefaults = '';
   let callStyle = '';
   let callMin = DEFAULT_CALL_MIN;
+  let callMenu = false;
   let oai = null;
   let timer = null;
   let speechStoppedAt = 0;
@@ -355,6 +401,7 @@ wss.on('connection', (ws) => {
   // Machine or fax: hang up right away, no message (saves credit). Human / unknown: carry on.
   const onAmd = (answeredBy) => {
     log('[' + id + '] AMD answered_by=' + answeredBy);
+    if (callMenu) { log('[' + id + '] menu mode - not hanging up on a machine'); return; }
     if (ending || voicemail) return;
     if (!/^machine_|^fax$/.test(answeredBy)) return;
     voicemail = true;
@@ -378,7 +425,7 @@ wss.on('connection', (ws) => {
 
   const instrFor = (first) => buildInstructions({
     lang: callLang, style: callStyle, address: currentAddress, opening: callOpening,
-    task: callTask, details: callDetails, defaults: callDefaults, forcedLang: callerLang, maxMin: callMin
+    task: callTask, details: callDetails, defaults: callDefaults, forcedLang: callerLang, maxMin: callMin, menu: callMenu
   }, first);
 
   const hangUp = (why) => {
@@ -408,7 +455,7 @@ wss.on('connection', (ws) => {
         type: 'realtime',
         output_modalities: ['audio'],
         instructions: instr,
-        tools: [END_CALL_TOOL],
+        tools: callMenu ? [END_CALL_TOOL, PRESS_KEYS_TOOL] : [END_CALL_TOOL],
         tool_choice: 'auto',
         audio: {
           input: {
@@ -430,7 +477,8 @@ wss.on('connection', (ws) => {
       if (ev.type === 'session.updated') {
         if (!greeted) {
           greeted = true;
-          try { oai.send(JSON.stringify({ type: 'response.create' })); log('[' + id + '] greeting requested'); } catch {}
+          if (callMenu) log('[' + id + '] menu mode - waiting to hear who answers');
+          else { try { oai.send(JSON.stringify({ type: 'response.create' })); log('[' + id + '] greeting requested'); } catch {} }
           const s = ev.session || {};
           const td = s.audio && s.audio.input && s.audio.input.turn_detection;
           log('[' + id + '] session td=' + JSON.stringify(td) + ' voice=' + JSON.stringify(s.audio && s.audio.output && s.audio.output.voice) + ' tools=' + JSON.stringify((s.tools || []).map((t) => t.name)));
@@ -496,6 +544,18 @@ wss.on('connection', (ws) => {
         else log('[' + id + '] response.done status=' + (r.status || '?') + ' outputs=' + JSON.stringify(outputs.map((o) => o.type)));
         turnText = '';
 
+        const keyCall = outputs.find((o) => o.type === 'function_call' && o.name === 'press_keys');
+        if (keyCall && callMenu && !ending) {
+          let digits = '';
+          try { digits = String(JSON.parse(keyCall.arguments || '{}').digits || ''); } catch {}
+          digits = digits.replace(/[^0-9*#]/g, '').slice(0, 10);
+          if (digits) {
+            const tones = dtmfMulaw(digits);
+            for (let i = 0; i < tones.length; i += 160) toTwilio({ event: 'media', streamSid, media: { payload: tones.subarray(i, i + 160).toString('base64') } });
+            log('[' + id + '] PRESSED ' + digits);
+          }
+          try { oai.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: keyCall.call_id, output: JSON.stringify({ ok: !!digits, pressed: digits }) } })); } catch {}
+        }
         const hangCall = outputs.find((o) => o.type === 'function_call' && o.name === 'end_call');
         const wantsHangup = !!hangCall;
         const saidBye = /bye|tạm biệt|goodbye|ngủ ngon|hẹn gặp|gặp lại|cảm ơn|thank/i.test(saidNow);
@@ -579,6 +639,7 @@ wss.on('connection', (ws) => {
       callDefaults = cp.defaults || '';
       callStyle = cp.style || '';
       callMin = callMinutes(cp.maxmin);
+      callMenu = cp.menu === '1';
       log('[' + id + '] start call=' + s.callSid + ' voice=' + (callVoice || '(default)') + ' style=' + (callStyle ? 'custom' : '(default)') + ' mode=' + (callTask ? 'task' : 'chat') + ' limit=' + callMin + 'min');
       if (!twilioLeg.endsWith(TWILIO_NUMBER.replace('+', '')) && twilioLeg !== TWILIO_NUMBER) {
         log('[' + id + '] REJECT call - twilio number not on this stream (' + (twilioLeg || 'none') + ')');
